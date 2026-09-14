@@ -2,10 +2,12 @@ mod ast_parser;
 mod cli;
 mod error;
 mod graph_math;
+mod groq_client;
 mod ingestion;
 mod models;
 mod osv_client;
 mod pipeline;
+mod remediation;
 mod scoring;
 mod tui;
 
@@ -15,6 +17,11 @@ use comfy_table::{presets::UTF8_FULL, Table};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Best-effort: picks up GROQ_API_KEY (and anything else) from a local
+    // .env if present. Silently does nothing if there isn't one — env vars
+    // set the normal way still work either way.
+    let _ = dotenvy::dotenv();
+
     let cli = Cli::parse();
 
     let config = pipeline::PipelineConfig {
@@ -23,7 +30,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     if cli.interactive {
-        tui::run(config).await?;
+        tui::run(config, cli.groq_model.clone()).await?;
         return Ok(());
     }
 

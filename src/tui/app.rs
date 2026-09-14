@@ -1,5 +1,6 @@
 use crate::models::RiskAssessment;
 use crate::pipeline::PipelineOutput;
+use crate::remediation::ProposedFix;
 
 #[derive(Default)]
 pub struct App {
@@ -7,6 +8,8 @@ pub struct App {
     pub assessments: Vec<RiskAssessment>,
     pub total_found: usize,
     pub selected: usize,
+    pub fix_prompt: Option<ProposedFix>,
+    pub fix_in_flight: bool,
 }
 
 impl App {

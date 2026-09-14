@@ -24,6 +24,11 @@ pub struct Cli {
     /// risk = base_severity * reachable * (1 + centrality_weight * centrality).
     #[arg(long, default_value_t = crate::scoring::DEFAULT_CENTRALITY_WEIGHT)]
     pub centrality_weight: f64,
+
+    /// Groq model used for mitigation suggestions when no patched version
+    /// exists yet (interactive mode only). Requires GROQ_API_KEY to be set.
+    #[arg(long, default_value = crate::groq_client::DEFAULT_MODEL)]
+    pub groq_model: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]

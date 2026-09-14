@@ -8,6 +8,9 @@ pub enum DaggerError {
     #[error("tree-sitter grammar error: {0}")]
     Grammar(String),
 
+    #[error("remediation error: {0}")]
+    Remediation(String),
+
     #[error("HTTP request failed: {0}")]
     Http(#[from] reqwest::Error),
 

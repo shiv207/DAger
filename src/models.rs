@@ -41,6 +41,10 @@ pub struct Vulnerability {
     /// category like "HIGH"), kept for display even when we couldn't turn
     /// it into a number.
     pub raw_severity: Option<String>,
+    /// The lowest patched version OSV's `affected[].ranges[].events` lists
+    /// above the currently-resolved version, if any. Drives the version-bump
+    /// remediation path — no LLM involved, this is a direct read of OSV data.
+    pub fixed_version: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

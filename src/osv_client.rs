@@ -8,6 +8,7 @@
 use crate::error::Result;
 use crate::models::{PackageId, Vulnerability};
 use reqwest::Client;
+use semver::Version;
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinSet;
 
@@ -58,6 +59,8 @@ struct OsvVulnDetail {
     severity: Vec<OsvSeverity>,
     #[serde(default)]
     database_specific: Option<serde_json::Value>,
+    #[serde(default)]
+    affected: Vec<OsvAffected>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -65,6 +68,34 @@ struct OsvSeverity {
     #[serde(rename = "type")]
     kind: String,
     score: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct OsvAffected {
+    #[serde(default)]
+    package: Option<OsvAffectedPackage>,
+    #[serde(default)]
+    ranges: Vec<OsvRange>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OsvAffectedPackage {
+    #[serde(default)]
+    name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OsvRange {
+    #[serde(rename = "type")]
+    range_type: String,
+    #[serde(default)]
+    events: Vec<OsvEvent>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OsvEvent {
+    #[serde(default)]
+    fixed: Option<String>,
 }
 
 /// Batch-queries OSV for every package in `packages`, then hydrates every
@@ -132,6 +163,7 @@ async fn fetch_vuln_detail(client: &Client, id: &str, package: PackageId) -> Res
         .await?;
 
     let (severity_score, raw_severity) = extract_base_severity(&detail);
+    let fixed_version = extract_fixed_version(&detail, &package);
 
     Ok(Vulnerability {
         id: detail.id,
@@ -139,7 +171,35 @@ async fn fetch_vuln_detail(client: &Client, id: &str, package: PackageId) -> Res
         summary: detail.summary.unwrap_or_default(),
         severity_score,
         raw_severity,
+        fixed_version,
     })
+}
+
+/// Finds the lowest patched version above `package.version` across every
+/// SEMVER range OSV lists for this package. Deterministic read of OSV's own
+/// data — no guessing, no LLM involved.
+fn extract_fixed_version(detail: &OsvVulnDetail, package: &PackageId) -> Option<String> {
+    let current = Version::parse(&package.version).ok()?;
+
+    detail
+        .affected
+        .iter()
+        .filter(|affected| {
+            affected
+                .package
+                .as_ref()
+                .and_then(|p| p.name.as_deref())
+                .map(|name| name == package.name)
+                .unwrap_or(true)
+        })
+        .flat_map(|affected| &affected.ranges)
+        .filter(|range| range.range_type == "SEMVER")
+        .flat_map(|range| &range.events)
+        .filter_map(|event| event.fixed.as_deref())
+        .filter_map(|v| Version::parse(v).ok())
+        .filter(|v| *v > current)
+        .min()
+        .map(|v| v.to_string())
 }
 
 fn extract_base_severity(detail: &OsvVulnDetail) -> (Option<f64>, Option<String>) {

@@ -20,6 +20,9 @@ anyhow = "1"
 thiserror = "1"
 comfy-table = "7"
 walkdir = "2"
+semver = "1"
+toml_edit = "0.22"
+dotenvy = "0.15"
 
 [profile.release]
 lto = true
