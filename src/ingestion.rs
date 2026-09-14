@@ -35,6 +35,7 @@ pub fn build_dependency_graph(project_path: &Path) -> Result<(DiGraph<PackageNod
             // defaults to Normal for the root package (which has none).
             dependency_kind: DependencyKind::Normal,
             source_used: false,
+            centrality: 0.0,
         };
         let idx = graph.add_node(node);
         index_by_id.insert(package.id.clone(), idx);

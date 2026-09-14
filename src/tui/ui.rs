@@ -1,14 +1,12 @@
 use super::theme;
+use super::tree_view::{self, NodeStatus};
 use super::App;
+use crate::groq_client::Role;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{
-        block::Position,
-        canvas::{Canvas, Points},
-        Block, BorderType, Borders, Clear, List, ListItem, Paragraph,
-    },
+    widgets::{block::Position, Block, BorderType, Borders, Clear, List, ListItem, Paragraph, Wrap},
     Frame,
 };
 
@@ -24,18 +22,23 @@ pub fn draw(frame: &mut Frame, app: &App) {
 
     draw_header(frame, app, root[0]);
 
-    let body = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(25),
-            Constraint::Percentage(45),
-            Constraint::Percentage(30),
-        ])
-        .split(root[1]);
+    if app.chat.open {
+        draw_chat(frame, app, root[1]);
+    } else {
+        let body = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(25),
+                Constraint::Percentage(45),
+                Constraint::Percentage(30),
+            ])
+            .split(root[1]);
 
-    draw_log_pane(frame, app, body[0]);
-    draw_graph_canvas(frame, app, body[1]);
-    draw_scorecard(frame, app, body[2]);
+        draw_log_pane(frame, app, body[0]);
+        draw_dependency_tree(frame, app, body[1]);
+        draw_scorecard(frame, app, body[2]);
+    }
+
     draw_footer(frame, app, root[2]);
 
     if let Some(fix) = &app.fix_prompt {
@@ -90,14 +93,19 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
+    let in_flight = app.fix_in_flight || app.chat.in_flight;
     let text = if app.fix_in_flight {
         " fetching fix suggestion from groq... "
+    } else if app.chat.in_flight {
+        " qwen is thinking... "
     } else if app.fix_prompt.is_some() {
         " y confirm    n/esc dismiss "
+    } else if app.chat.open {
+        " type your question    enter send    esc close chat "
     } else {
-        " j/k select    f fix selected    q quit "
+        " j/k select    f fix selected    c chat with qwen    q quit "
     };
-    let style = if app.fix_in_flight {
+    let style = if in_flight {
         Style::default().fg(theme::ACCENT)
     } else {
         Style::default().fg(theme::MUTED)
@@ -120,38 +128,40 @@ fn draw_log_pane(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(list, area);
 }
 
-fn draw_graph_canvas(frame: &mut Frame, app: &App, area: Rect) {
-    // TODO(algorithm): nodes sit on a simple circular layout keyed by index,
-    // not a real force-directed graph layout (e.g. Fruchterman-Reingold over
-    // the petgraph structure). Dot color/radius already reflect real
-    // reachability and centrality data from the pipeline — only the (x, y)
-    // placement is a placeholder.
-    let n = app.assessments.len().max(1) as f64;
-    let assessments = &app.assessments;
-    let canvas = Canvas::default()
-        .block(panel_block("dependency graph"))
-        .x_bounds([-1.2, 1.2])
-        .y_bounds([-1.2, 1.2])
-        .paint(move |ctx| {
-            for (i, assessment) in assessments.iter().enumerate() {
-                let angle = 2.0 * std::f64::consts::PI * (i as f64) / n;
-                let radius = 0.3 + 0.6 * assessment.centrality;
-                let x = radius * angle.cos();
-                let y = radius * angle.sin();
-                let color = if !assessment.reachable {
-                    theme::MUTED
-                } else if assessment.centrality > 0.5 {
-                    theme::DANGER
-                } else {
-                    theme::WARNING
+fn draw_dependency_tree(frame: &mut Frame, app: &App, area: Rect) {
+    // TODO: renders top-down and simply clips once the pane fills, rather
+    // than scrolling — vulnerable nodes are sorted ahead of safe siblings
+    // (tree_view::build_tree) specifically so they surface near the top
+    // instead of being clipped out on a large dependency tree.
+    let tree = tree_view::build_tree(&app.graph, &app.vulnerable_names, &app.reachable_vulnerable_names);
+    let visible_rows = area.height.saturating_sub(2) as usize;
+
+    let lines: Vec<Line> = if tree.is_empty() {
+        vec![Line::styled("(no packages resolved)", Style::default().fg(theme::MUTED))]
+    } else {
+        tree.iter()
+            .take(visible_rows)
+            .map(|entry| {
+                let color = match entry.status {
+                    NodeStatus::Safe => theme::DIM,
+                    NodeStatus::VulnerableUnreachable => theme::MUTED,
+                    NodeStatus::VulnerableReachable if entry.centrality > 0.5 => theme::DANGER,
+                    NodeStatus::VulnerableReachable => theme::WARNING,
                 };
-                ctx.draw(&Points {
-                    coords: &[(x, y)],
-                    color,
-                });
-            }
-        });
-    frame.render_widget(canvas, area);
+                let suffix = if entry.is_repeat { " (*)" } else { "" };
+                Line::from(vec![
+                    Span::styled(entry.prefix.clone(), Style::default().fg(theme::BORDER)),
+                    Span::styled(
+                        format!("{}@{}{suffix}", entry.name, entry.version),
+                        Style::default().fg(color),
+                    ),
+                ])
+            })
+            .collect()
+    };
+
+    let paragraph = Paragraph::new(lines).block(panel_block("dependency tree"));
+    frame.render_widget(paragraph, area);
 }
 
 fn draw_scorecard(frame: &mut Frame, app: &App, area: Rect) {
@@ -220,6 +230,71 @@ fn draw_scorecard(frame: &mut Frame, app: &App, area: Rect) {
 
     let scorecard = Paragraph::new(body).block(panel_block("scorecard"));
     frame.render_widget(scorecard, area);
+}
+
+fn draw_chat(frame: &mut Frame, app: &App, area: Rect) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(3)])
+        .split(area);
+
+    let mut lines: Vec<Line> = Vec::new();
+    if app.chat.messages.is_empty() {
+        lines.push(Line::styled(
+            "Ask anything — e.g. \"what's actually wrong here?\" or",
+            Style::default().fg(theme::MUTED),
+        ));
+        lines.push(Line::styled(
+            "\"explain reachability like I'm five\".",
+            Style::default().fg(theme::MUTED),
+        ));
+    }
+    for message in &app.chat.messages {
+        let (label, color) = match message.role {
+            Role::User => ("you", theme::ACCENT),
+            Role::Assistant => ("qwen", theme::SUCCESS),
+            Role::System => continue, // never stored as a message; rebuilt fresh per send
+        };
+        lines.push(Line::styled(
+            format!("{label}:"),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ));
+        for content_line in message.content.lines() {
+            lines.push(Line::styled(content_line.to_string(), Style::default().fg(theme::TEXT)));
+        }
+        lines.push(Line::default());
+    }
+    if app.chat.in_flight {
+        lines.push(Line::styled(
+            "qwen is thinking...",
+            Style::default().fg(theme::ACCENT).add_modifier(Modifier::ITALIC),
+        ));
+    }
+
+    // Approximate auto-scroll-to-bottom: counts logical lines, not the
+    // wrapped rows Paragraph actually renders, so this undercounts once
+    // any single message wraps across multiple terminal columns. Good
+    // enough to keep recent messages on screen; not pixel-exact.
+    let visible_rows = chunks[0].height.saturating_sub(2);
+    let scroll = (lines.len() as u16).saturating_sub(visible_rows);
+
+    let history = Paragraph::new(lines)
+        .block(panel_block("chat with qwen"))
+        .wrap(Wrap { trim: false })
+        .scroll((scroll, 0));
+    frame.render_widget(history, chunks[0]);
+
+    let input = Paragraph::new(Line::from(vec![
+        Span::styled("> ", Style::default().fg(theme::ACCENT)),
+        Span::styled(app.chat.input.as_str(), Style::default().fg(theme::TEXT)),
+    ]))
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(theme::BORDER)),
+    );
+    frame.render_widget(input, chunks[1]);
 }
 
 fn draw_fix_popup(frame: &mut Frame, fix: &crate::remediation::ProposedFix) {

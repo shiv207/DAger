@@ -25,6 +25,12 @@ pub struct PackageNode {
     /// syntactic half of "reachable" (see Q7 in the design discussion) —
     /// it is not a call graph.
     pub source_used: bool,
+    /// Normalized PageRank centrality (see `graph_math::normalize`), written
+    /// back onto each node after `pipeline::run` computes it. Lives on the
+    /// node itself (rather than a separate `HashMap<NodeIndex, f64>` the
+    /// caller has to keep threading around) so anything holding the graph —
+    /// the TUI's dependency-graph canvas included — has it for free.
+    pub centrality: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

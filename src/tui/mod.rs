@@ -1,11 +1,17 @@
+mod ansi_art;
 mod app;
+mod chat;
+mod splash;
 mod theme;
+mod tree_view;
 mod ui;
 
 pub use app::App;
 
+use crate::groq_client::Role;
 use crate::pipeline::{self, PipelineConfig};
 use crate::remediation;
+use chat::ChatMessage;
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
     execute,
@@ -13,7 +19,6 @@ use crossterm::{
 };
 use ratatui::{backend::Backend, backend::CrosstermBackend, Terminal};
 use std::io;
-use std::path::Path;
 use std::time::Duration;
 
 pub async fn run(config: PipelineConfig, groq_model: String) -> anyhow::Result<()> {
@@ -44,7 +49,7 @@ async fn run_app<B: Backend>(
     config: PipelineConfig,
     groq_model: String,
 ) -> anyhow::Result<()> {
-    let project_path = config.project_path.clone();
+    show_splash(terminal)?;
 
     // v1 runs the pipeline to completion before the TUI becomes interactive,
     // streaming log lines into `app` as it goes. A live-updating pipeline
@@ -63,11 +68,26 @@ async fn run_app<B: Backend>(
             if let Event::Key(key) = event::read()? {
                 if app.fix_prompt.is_some() {
                     match key.code {
-                        KeyCode::Char('y') => confirm_fix(app, &project_path).await,
+                        KeyCode::Char('y') => confirm_fix(app, &config, terminal).await,
                         KeyCode::Char('n') | KeyCode::Esc => {
                             app.fix_prompt = None;
                             app.push_log("[FIX] dismissed.");
                         }
+                        _ => {}
+                    }
+                    continue;
+                }
+
+                if app.chat.open {
+                    match key.code {
+                        KeyCode::Esc => app.chat.open = false,
+                        KeyCode::Enter if !app.chat.in_flight => {
+                            send_chat_message(app, &http_client, &groq_model, terminal).await
+                        }
+                        KeyCode::Backspace => {
+                            app.chat.input.pop();
+                        }
+                        KeyCode::Char(c) if !app.chat.in_flight => app.chat.input.push(c),
                         _ => {}
                     }
                     continue;
@@ -80,10 +100,30 @@ async fn run_app<B: Backend>(
                     KeyCode::Char('f') => {
                         request_fix(app, &http_client, &groq_model, terminal).await
                     }
+                    KeyCode::Char('c') => app.chat.open = true,
                     _ => {}
                 }
             }
         }
+    }
+
+    Ok(())
+}
+
+const SPLASH_TIMEOUT: Duration = Duration::from_millis(1800);
+const SPLASH_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+fn show_splash<B: Backend>(terminal: &mut Terminal<B>) -> anyhow::Result<()> {
+    terminal.draw(splash::draw)?;
+
+    let mut waited = Duration::ZERO;
+    while waited < SPLASH_TIMEOUT {
+        if event::poll(SPLASH_POLL_INTERVAL)? {
+            if let Event::Key(_) = event::read()? {
+                break;
+            }
+        }
+        waited += SPLASH_POLL_INTERVAL;
     }
 
     Ok(())
@@ -131,7 +171,60 @@ async fn request_fix<B: Backend>(
     app.fix_prompt = Some(fix);
 }
 
-async fn confirm_fix(app: &mut App, project_path: &Path) {
+async fn send_chat_message<B: Backend>(
+    app: &mut App,
+    client: &reqwest::Client,
+    groq_model: &str,
+    terminal: &mut Terminal<B>,
+) {
+    let user_text = app.chat.input.trim().to_string();
+    if user_text.is_empty() {
+        return;
+    }
+    app.chat.input.clear();
+    app.chat.messages.push(ChatMessage {
+        role: Role::User,
+        content: user_text,
+    });
+
+    let Ok(api_key) = std::env::var("GROQ_API_KEY") else {
+        app.chat.messages.push(ChatMessage {
+            role: Role::Assistant,
+            content: "GROQ_API_KEY isn't set, so I can't reach the model. Set it in .env or your environment and reopen the chat.".to_string(),
+        });
+        return;
+    };
+
+    app.chat.in_flight = true;
+    // Same redraw-before-await trick as request_fix: without this the
+    // "thinking..." state never actually paints before the response lands.
+    let _ = terminal.draw(|frame| ui::draw(frame, app));
+
+    // Rebuilt fresh every send (not cached at chat-open time) so it always
+    // reflects the live pipeline results.
+    let system_prompt = chat::build_system_prompt(app);
+    let mut history = vec![(Role::System, system_prompt)];
+    history.extend(
+        app.chat
+            .messages
+            .iter()
+            .map(|m| (m.role, m.content.clone())),
+    );
+
+    let result = crate::groq_client::chat_completion(client, &api_key, groq_model, &history, 0.3).await;
+    app.chat.in_flight = false;
+
+    let reply = match result {
+        Ok(reply) => reply,
+        Err(err) => format!("(request to Groq failed: {err})"),
+    };
+    app.chat.messages.push(ChatMessage {
+        role: Role::Assistant,
+        content: reply,
+    });
+}
+
+async fn confirm_fix<B: Backend>(app: &mut App, config: &PipelineConfig, terminal: &mut Terminal<B>) {
     let Some(fix) = app.fix_prompt.take() else {
         return;
     };
@@ -145,8 +238,28 @@ async fn confirm_fix(app: &mut App, project_path: &Path) {
     }
 
     app.push_log("[FIX] applying version bump...");
-    match remediation::apply_version_bump(project_path, &fix).await {
-        Ok(summary) => app.push_log(&format!("[FIXED] {summary}. Re-run dagger to confirm.")),
+    let _ = terminal.draw(|frame| ui::draw(frame, app));
+
+    match remediation::apply_version_bump(&config.project_path, &fix).await {
+        Ok(summary) => {
+            app.push_log(&format!("[FIXED] {summary}"));
+            app.push_log("[FIX] re-scanning to confirm the fix took...");
+            let _ = terminal.draw(|frame| ui::draw(frame, app));
+
+            // Re-run the whole pipeline rather than just deleting this one
+            // row: OSV is queried again against the now-bumped version (so
+            // a vulnerability genuinely disappears only because it's
+            // actually gone, not because we assumed the fix worked), and
+            // the dependency tree/centrality reflect whatever the bump
+            // pulled in transitively.
+            match pipeline::run(config, |line| app.push_log(line)).await {
+                Ok(output) => {
+                    app.load_output(output);
+                    app.selected = 0;
+                }
+                Err(err) => app.push_log(&format!("[FIX] re-scan failed: {err} (fix was applied to disk regardless)")),
+            }
+        }
         Err(err) => app.push_log(&format!("[FIX] failed: {err}")),
     }
 }

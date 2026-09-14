@@ -1,0 +1,10 @@
+[package]
+name = "dagger-playground"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Deliberately vulnerable fixture for exercising DAGger's reachability and fix flow. Do not depend on this for anything real."
+
+[dependencies]
+lru = "=0.12.5"
+paste = "=1.0.15"

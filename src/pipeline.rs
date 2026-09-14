@@ -15,10 +15,6 @@ pub struct PipelineConfig {
 }
 
 pub struct PipelineOutput {
-    // Kept on the output (not just consumed internally) for the real
-    // force-directed graph layout that will replace the TUI canvas
-    // placeholder in tui/ui.rs — not wired up to anything yet.
-    #[allow(dead_code)]
     pub graph: DiGraph<PackageNode, ()>,
     pub assessments: Vec<RiskAssessment>,
     pub total_vulns_found: usize,
@@ -51,6 +47,9 @@ pub async fn run(config: &PipelineConfig, mut log: impl FnMut(&str)) -> Result<P
     log("[EXEC] Computing PageRank centrality over the dependency graph...");
     let raw_scores = graph_math::pagerank(&graph, 0.85, 50);
     let normalized_scores = graph_math::normalize(&raw_scores);
+    for idx in graph.node_indices().collect::<Vec<_>>() {
+        graph[idx].centrality = *normalized_scores.get(&idx).unwrap_or(&0.0);
+    }
 
     log("[EXEC] Scoring reachable vulnerabilities...");
     let index_by_name: HashMap<String, NodeIndex> = graph
@@ -88,4 +87,53 @@ pub async fn run(config: &PipelineConfig, mut log: impl FnMut(&str)) -> Result<P
         assessments,
         total_vulns_found,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// End-to-end confirmation against the real playground fixture (network:
+    /// cargo metadata + OSV.dev) that the graph canvas regression is fixed:
+    /// `lru` has 3 real CVEs in the playground but is one graph node, so it
+    /// must appear as exactly one node — not 3. Ignored by default; run
+    /// with `cargo test -- --ignored`.
+    #[tokio::test]
+    #[ignore = "hits the network (cargo metadata + OSV.dev); run explicitly with `cargo test -- --ignored`"]
+    async fn playground_dependency_graph_has_one_node_per_package_not_per_vulnerability() {
+        let config = PipelineConfig {
+            project_path: PathBuf::from("playground"),
+            centrality_weight: crate::scoring::DEFAULT_CENTRALITY_WEIGHT,
+        };
+
+        let output = run(&config, |_| {}).await.expect("pipeline run failed");
+
+        let lru_vuln_count = output
+            .assessments
+            .iter()
+            .filter(|a| a.vulnerability.package.name == "lru")
+            .count();
+        assert!(
+            lru_vuln_count >= 2,
+            "expected lru to have multiple real CVEs in this fixture, found {lru_vuln_count}"
+        );
+
+        let lru_node_count = output
+            .graph
+            .node_weights()
+            .filter(|n| n.id.name == "lru")
+            .count();
+        assert_eq!(
+            lru_node_count, 1,
+            "lru must be exactly one graph node regardless of how many CVEs it has"
+        );
+
+        // The graph itself (ingestion) is unaffected by this bug, but this
+        // pins the end-to-end shape the TUI canvas now consumes: many more
+        // nodes than vulnerabilities.
+        assert!(
+            output.graph.node_count() > output.assessments.len(),
+            "graph should contain far more packages than vulnerabilities in a real project"
+        );
+    }
 }

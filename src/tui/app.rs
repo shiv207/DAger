@@ -1,6 +1,9 @@
-use crate::models::RiskAssessment;
+use super::chat::ChatState;
+use crate::models::{PackageNode, RiskAssessment};
 use crate::pipeline::PipelineOutput;
 use crate::remediation::ProposedFix;
+use petgraph::graph::DiGraph;
+use std::collections::HashSet;
 
 #[derive(Default)]
 pub struct App {
@@ -10,6 +13,10 @@ pub struct App {
     pub selected: usize,
     pub fix_prompt: Option<ProposedFix>,
     pub fix_in_flight: bool,
+    pub graph: DiGraph<PackageNode, ()>,
+    pub vulnerable_names: HashSet<String>,
+    pub reachable_vulnerable_names: HashSet<String>,
+    pub chat: ChatState,
 }
 
 impl App {
@@ -23,7 +30,19 @@ impl App {
 
     pub fn load_output(&mut self, output: PipelineOutput) {
         self.total_found = output.total_vulns_found;
+        self.vulnerable_names = output
+            .assessments
+            .iter()
+            .map(|a| a.vulnerability.package.name.clone())
+            .collect();
+        self.reachable_vulnerable_names = output
+            .assessments
+            .iter()
+            .filter(|a| a.reachable)
+            .map(|a| a.vulnerability.package.name.clone())
+            .collect();
         self.assessments = output.assessments;
+        self.graph = output.graph;
     }
 
     pub fn exploitable_count(&self) -> usize {
